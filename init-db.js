@@ -70,14 +70,22 @@ const createTables = async () => {
       item_id INT REFERENCES menu_items(id) ON DELETE SET NULL,
       item_name VARCHAR(100) NOT NULL,
       quantity INT NOT NULL,
-      notes VARCHAR(255)
+      notes VARCHAR(255),
+      status VARCHAR(20) DEFAULT 'PENDING'
     );
 
-    -- --- MIGRATIONS (Patches existing 'orders' table if missing columns) ---
+    -- 8. Ajustes / Settings Table (For Kitchen Mode & Ticket Format Presets)
+    CREATE TABLE IF NOT EXISTS ajustes (
+      clave VARCHAR(50) PRIMARY KEY,
+      valor VARCHAR(255) NOT NULL
+    );
+
+    -- --- MIGRATIONS ---
     ALTER TABLE orders ADD COLUMN IF NOT EXISTS waiter_name VARCHAR(100) DEFAULT 'Staff';
     ALTER TABLE orders ADD COLUMN IF NOT EXISTS guest_count INT DEFAULT 1;
     ALTER TABLE orders ADD COLUMN IF NOT EXISTS total_amount NUMERIC(10, 2) DEFAULT 0.00;
     ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_method VARCHAR(20);
+    ALTER TABLE order_items ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'PENDING';
   `;
 
   try {
@@ -85,13 +93,26 @@ const createTables = async () => {
     await pool.query(queryText);
     console.log("Database tables and column migrations applied successfully.");
 
-    // Seed default waiter accounts for testing
+    // Seed default waiter accounts
     await pool.query(`
       INSERT INTO waiters (name, pin) 
       VALUES ('Alex', '1234'), ('Maria', '5678')
       ON CONFLICT (name) DO NOTHING;
     `);
-    console.log("Default waiters seeded (Alex: 1234, Maria: 5678).");
+
+    // Seed default settings matching friend's settings UI
+    await pool.query(`
+      INSERT INTO ajustes (clave, valor) VALUES 
+        ('modo_cocina', 'solo_impresora'),
+        ('tipo_impresora', 'red'),
+        ('ip_impresora', '192.168.1.151'),
+        ('puerto_impresora', '9100'),
+        ('caracteres_linea', '32'),
+        ('tamano_papel', '58mm')
+      ON CONFLICT (clave) DO NOTHING;
+    `);
+
+    console.log("Default waiters and printer settings (ajustes) seeded.");
 
   } catch (err) {
     console.error("Error setting up database tables:", err);

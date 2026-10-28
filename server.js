@@ -75,8 +75,8 @@ app.post('/api/orders', async (req, res) => {
 
     for (const item of items) {
       await client.query(
-        'INSERT INTO order_items (order_id, item_id, item_name, quantity, notes) VALUES ($1, $2, $3, $4, $5)',
-        [orderId, item.item_id || null, item.item_name, item.quantity, item.notes || '']
+        'INSERT INTO order_items (order_id, item_id, item_name, quantity, notes, status) VALUES ($1, $2, $3, $4, $5, $6)',
+        [orderId, item.item_id || null, item.item_name, item.quantity, item.notes || '', 'PENDING']
       );
 
       const printerRes = await client.query(
@@ -137,7 +137,7 @@ app.post('/api/orders', async (req, res) => {
   }
 });
 
-// --- FETCH ACTIVE ORDERS (Desktop Admin & Waiter Terminals) ---
+// --- FETCH ACTIVE ORDERS ---
 app.get('/api/orders/active', async (req, res) => {
   try {
     const result = await db.query(`
@@ -166,7 +166,6 @@ app.get('/api/orders/active', async (req, res) => {
 app.post('/api/orders/checkout', async (req, res) => {
   const { order_id, payment_method, total_amount, status } = req.body;
   try {
-    // 1. Update order status to CLOSED and record payment details
     const orderRes = await db.query(
       "UPDATE orders SET status = $1, payment_method = $2, total_amount = $3 WHERE id = $4 RETURNING table_number",
       [status || 'CLOSED', payment_method, total_amount, order_id]
@@ -174,7 +173,6 @@ app.post('/api/orders/checkout', async (req, res) => {
 
     if (orderRes.rows.length > 0) {
       const tableNumber = orderRes.rows[0].table_number;
-      // 2. Mark table as AVAILABLE
       await db.query("UPDATE tables SET status = 'AVAILABLE' WHERE table_number = $1", [tableNumber]);
     }
 
@@ -324,6 +322,66 @@ app.post('/api/printers', async (req, res) => {
   }
 });
 
+app.delete('/api/printers/:id', async (req, res) => {
+  const { id } = req.params;
+  try {
+    await db.query('DELETE FROM printers WHERE id = $1', [id]);
+    res.json({ message: 'Printer deleted successfully' });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to delete printer' });
+  }
+});
+
+app.post('/api/printers/test', async (req, res) => {
+  const { ip_address, port, name } = req.body;
+  try {
+    await printQueue.add('printJob', {
+      printerIp: ip_address,
+      printerPort: port || 9100,
+      orderData: {
+        orderId: 0,
+        tableNumber: 'TEST',
+        guestCount: 1,
+        stationName: name || 'TEST PRINTER',
+        createdAt: new Date(),
+        items: [{ item_name: 'Printer Connection Test OK', quantity: 1, notes: 'ESC/POS Verified' }],
+      },
+    });
+    res.json({ message: `Test print job queued for ${name} (${ip_address}:${port || 9100})` });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to queue test print job', details: err.message });
+  }
+});
+
+// --- AJUSTES / CONFIGURATION ROUTES ---
+app.get('/api/ajustes', async (req, res) => {
+  try {
+    const result = await db.query('SELECT clave, valor FROM ajustes');
+    const settings = {};
+    result.rows.forEach(row => {
+      settings[row.clave] = row.valor;
+    });
+    res.json(settings);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/ajustes', async (req, res) => {
+  const settings = req.body;
+  try {
+    for (const [clave, valor] of Object.entries(settings)) {
+      await db.query(
+        'INSERT INTO ajustes (clave, valor) VALUES ($1, $2) ON CONFLICT (clave) DO UPDATE SET valor = EXCLUDED.valor',
+        [clave, String(valor)]
+      );
+    }
+    res.json({ success: true, message: 'Ajustes guardados correctamente' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // --- TABLE MANAGEMENT ROUTES ---
 app.get('/api/tables', async (req, res) => {
   try {
@@ -345,8 +403,114 @@ app.put('/api/tables/:table_number/status', async (req, res) => {
   }
 });
 
+app.get('/api/orders/table/:table_number/items', async (req, res) => {
+  const { table_number } = req.params;
+  try {
+    const result = await db.query(`
+      SELECT 
+        oi.id,
+        oi.item_id,
+        oi.item_name,
+        oi.quantity,
+        oi.notes,
+        COALESCE(mi.price, 0) AS price
+      FROM orders o
+      JOIN order_items oi ON o.id = oi.order_id
+      LEFT JOIN menu_items mi ON oi.item_id = mi.id
+      WHERE LOWER(o.table_number) = LOWER($1) AND o.status IN ('ACTIVE', 'PENDING')
+      ORDER BY oi.id ASC
+    `, [table_number]);
+
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- KDS STATION-FILTERED ORDERS ENDPOINT ---
+app.get('/api/kds/orders', async (req, res) => {
+  const { station } = req.query;
+
+  try {
+    let query = `
+      SELECT 
+        o.id AS order_id,
+        o.table_number,
+        COALESCE(o.waiter_name, 'Staff') AS waiter_name,
+        o.created_at,
+        oi.id AS item_id,
+        oi.item_name,
+        oi.quantity,
+        oi.notes,
+        COALESCE(c.name, 'General') AS category_name,
+        COALESCE(p.name, 'Unassigned') AS station_name
+      FROM orders o
+      JOIN order_items oi ON o.id = oi.order_id
+      LEFT JOIN menu_items mi ON oi.item_id = mi.id
+      LEFT JOIN categories c ON mi.category_id = c.id
+      LEFT JOIN printers p ON c.printer_id = p.id
+      WHERE o.status IN ('ACTIVE', 'PENDING')
+        AND oi.status = 'PENDING'
+    `;
+
+    const params = [];
+
+    if (station && station.trim() !== '' && station.trim() !== 'All Stations') {
+      params.push(`%${station.trim()}%`);
+      query += ` AND LOWER(p.name) LIKE LOWER($${params.length})`;
+    }
+
+    query += ` ORDER BY o.created_at ASC, oi.id ASC`;
+
+    const result = await db.query(query, params);
+
+    const ordersMap = {};
+    result.rows.forEach(row => {
+      if (!ordersMap[row.order_id]) {
+        ordersMap[row.order_id] = {
+          order_id: row.order_id,
+          table_number: row.table_number,
+          waiter_name: row.waiter_name,
+          created_at: row.created_at,
+          items: [],
+        };
+      }
+      ordersMap[row.order_id].items.push({
+        item_id: row.item_id,
+        item_name: row.item_name,
+        quantity: row.quantity,
+        notes: row.notes,
+        category: row.category_name,
+        station: row.station_name,
+      });
+    });
+
+    res.json(Object.values(ordersMap));
+  } catch (err) {
+    console.error('Error fetching KDS orders:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- KDS MARK ALL ITEMS IN TICKET AS READY ---
+app.put('/api/kds/orders/:id/complete-items', async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    await db.query(
+      "UPDATE order_items SET status = 'READY' WHERE order_id = $1",
+      [id]
+    );
+    res.json({ success: true, message: `All items for Order #${id} marked as READY` });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // --- START SERVER ---
 const PORT = 3000;
-app.listen(PORT, () => {
-  console.log(`🚀 POS Backend Server running on http://localhost:${PORT}`);
+const HOST = '0.0.0.0'; // Binds to all network interfaces
+
+app.listen(PORT, HOST, () => {
+  console.log(`🚀 POS Backend Server running on http://${HOST}:${PORT}`);
 });
